@@ -221,3 +221,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.env
+knowledge-base-riscv/
+converted-md/
+preprocessed_db/

@@ -1,0 +1,9 @@
+chromadb
+litellm
+openai
+python-dotenv
+pydantic
+tenacity
+tqdm
+gradio
+docling
