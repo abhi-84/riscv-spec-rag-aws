@@ -226,3 +226,4 @@ __marimo__/
 knowledge-base-riscv/
 converted-md/
 preprocessed_db/
+.terraform/
