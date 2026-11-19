@@ -4,7 +4,8 @@ from chromadb import PersistentClient
 from litellm import completion
 from pydantic import BaseModel, Field
 from pathlib import Path
-from tenacity import retry, wait_exponential
+import logging
+from tenacity import retry, wait_exponential, stop_after_attempt
 
 
 load_dotenv(override=True)
@@ -12,12 +13,18 @@ load_dotenv(override=True)
 #MODEL = "openai/gpt-4o-mini"
 MODEL = "openrouter/openai/gpt-oss-120b"
 DB_NAME = str(Path(__file__).parent.parent / "preprocessed_db")
-KNOWLEDGE_BASE_PATH = Path(__file__).parent.parent / "knowledge-base"
-#SUMMARIES_PATH = Path(__file__).parent.parent / "summaries"
 
 collection_name = "docs"
 embedding_model = "text-embedding-3-large"
-wait = wait_exponential(multiplier=1, min=10, max=240)
+logger = logging.getLogger(__name__)
+
+# Bounded retries for interactive requests: 3 attempts, short waits, re-raise the real error.
+LLM_TIMEOUT = 30  # seconds per LLM call
+retry_policy = dict(
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
 
 openai = OpenAI()
 
@@ -51,8 +58,23 @@ class RankOrder(BaseModel):
     )
 
 
-@retry(wait=wait)
-def rerank(question, chunks):
+def _apply_order(order: list[int], chunks: list) -> list:
+    """Pure function: turn LLM-provided 1-based ids into a chunk list.
+    Drops invalid/duplicate ids and appends any chunks the LLM skipped."""
+    seen = set()
+    result = []
+    for i in order:
+        if 1 <= i <= len(chunks) and i not in seen:
+            seen.add(i)
+            result.append(chunks[i - 1])
+    for idx, chunk in enumerate(chunks, start=1):
+        if idx not in seen:
+            result.append(chunk)
+    return result
+
+
+@retry(**retry_policy)
+def _rerank_llm(question, chunks) -> list[int]:
     system_prompt = """
 You are a document re-ranker.
 You are provided with a question and a list of relevant chunks of text from a query of a knowledge base.
@@ -69,10 +91,19 @@ Reply only with the list of ranked chunk ids, nothing else. Include all the chun
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    response = completion(model=MODEL, messages=messages, response_format=RankOrder)
+    response = completion(model=MODEL, messages=messages, response_format=RankOrder, timeout=LLM_TIMEOUT)
     reply = response.choices[0].message.content
-    order = RankOrder.model_validate_json(reply).order
-    return [chunks[i - 1] for i in order]
+    return RankOrder.model_validate_json(reply).order
+
+
+def rerank(question, chunks):
+    """Reranking is optional: if it fails, fall back to retrieval order instead of failing the request."""
+    try:
+        order = _rerank_llm(question, chunks)
+    except Exception:
+        logger.warning("Rerank failed; falling back to retrieval order", exc_info=True)
+        return chunks
+    return _apply_order(order, chunks)
 
 
 def make_rag_messages(question, history, chunks):
@@ -87,9 +118,10 @@ def make_rag_messages(question, history, chunks):
     )
 
 
-@retry(wait=wait)
-def rewrite_query(question, history=[]):
+@retry(**retry_policy)
+def rewrite_query(question: str, history: list[dict] | None = None) -> str:
     """Rewrite the user's question to be a more specific question that is more likely to surface relevant content in the Knowledge Base."""
+    history = history or []
     message = f"""
 You are in a conversation with an engineer, answering questions about RISC-V specifications.
 You are about to look up information in a Knowledge Base to answer the user's question.
@@ -104,8 +136,8 @@ Respond only with a short, refined question that you will use to search the Know
 It should be a VERY short specific question most likely to surface content. Focus on the question details.
 IMPORTANT: Respond ONLY with the precise knowledgebase query, nothing else.
 """
-    response = completion(model=MODEL, messages=[{"role": "system", "content": message}])
-    return response.choices[0].message.content
+    response = completion(model=MODEL, messages=[{"role": "system", "content": message}], timeout=LLM_TIMEOUT)
+    return response.choices[0].message.content.strip()
 
 
 def merge_chunks(chunks, reranked):
@@ -126,8 +158,8 @@ def fetch_context_unranked(question):
     return chunks
 
 
-def fetch_context(original_question):
-    rewritten_question = rewrite_query(original_question)
+def fetch_context(original_question: str, history: list[dict] | None = None):
+    rewritten_question = rewrite_query(original_question, history)
     chunks1 = fetch_context_unranked(original_question)
     chunks2 = fetch_context_unranked(rewritten_question)
     chunks = merge_chunks(chunks1, chunks2)
@@ -135,12 +167,18 @@ def fetch_context(original_question):
     return reranked[:FINAL_K]
 
 
-@retry(wait=wait)
-def answer_question(question: str, history: list[dict] = []) -> tuple[str, list]:
+@retry(**retry_policy)
+def _generate(messages) -> str:
+    response = completion(model=MODEL, messages=messages, timeout=LLM_TIMEOUT)
+    return response.choices[0].message.content
+
+
+def answer_question(question: str, history: list[dict] | None = None) -> tuple[str, list]:
     """
-    Answer a question using RAG and return the answer and the retrieved context
+    Answer a question using RAG and return the answer and the retrieved context.
+    Retries live on the individual LLM calls, not on this whole pipeline.
     """
-    chunks = fetch_context(question)
+    history = history or []
+    chunks = fetch_context(question, history)
     messages = make_rag_messages(question, history, chunks)
-    response = completion(model=MODEL, messages=messages)
-    return response.choices[0].message.content, chunks
+    return _generate(messages), chunks
