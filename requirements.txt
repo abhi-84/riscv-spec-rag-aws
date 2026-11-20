@@ -1,0 +1,9 @@
+# Application (app/ package). poc/ keeps requirements-poc.txt.
+pydantic>=2
+pydantic-settings>=2
+litellm
+openai
+chromadb
+tenacity
+python-dotenv
+pytest
